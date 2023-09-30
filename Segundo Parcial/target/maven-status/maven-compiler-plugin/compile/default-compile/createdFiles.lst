@@ -1,0 +1,13 @@
+com\edu\gt\model\Catedratico.class
+com\edu\gt\dto\CatedraticoDto.class
+com\edu\gt\dto\CursoDto.class
+com\edu\gt\repository\CatedraticoRepository.class
+com\edu\gt\resource\CatedraticoResource.class
+com\edu\gt\resource\CursoResource.class
+com\edu\gt\model\Alumno.class
+com\edu\gt\dto\AlumnoDto.class
+com\edu\gt\repository\CursoRepository.class
+com\edu\gt\resource\AlumnoResource.class
+META-INF\panache-archive.marker
+com\edu\gt\model\Curso.class
+com\edu\gt\repository\AlumnoRepository.class
