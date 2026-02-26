@@ -37,7 +37,7 @@ jobs:
             fi
           done
           if [ "$fail" -ne 0 ]; then
-            echo "Missing required configuration in Environment 'NOX CI/CD'"
+            echo "Missing required configuration in Environment 'KNOXCICDSEC'"
             exit 3
           fi
 
