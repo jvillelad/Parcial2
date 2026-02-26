@@ -1,18 +1,45 @@
 name: KNOX Managed Scan
+
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master", "develop" ]
   workflow_dispatch:
 
 jobs:
   managed-scan:
     runs-on: ubuntu-latest
     environment: NOX CI/CD
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y curl jq
+
+      - name: Validate required env vars (safe)
+        env:
+          SL_API_URL: ${{ vars.SL_API_URL }}
+          SL_TRIGGER_TOKEN: ${{ secrets.SL_TRIGGER_TOKEN }}
+          SL_ORG_KEY: ${{ vars.SL_ORG_KEY }}
+          SL_PROJECT_KEY: ${{ vars.SL_PROJECT_KEY }}
+          SL_REPO_WORKSPACE: ${{ vars.SL_REPO_WORKSPACE }}
+          SL_REPO_SLUG: ${{ vars.SL_REPO_SLUG }}
+        run: |
+          set -euo pipefail
+          fail=0
+          for k in SL_API_URL SL_TRIGGER_TOKEN SL_ORG_KEY SL_PROJECT_KEY SL_REPO_WORKSPACE SL_REPO_SLUG; do
+            if [ -z "${!k:-}" ]; then
+              echo "$k=MISSING"
+              fail=1
+            else
+              echo "$k=OK"
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "Missing required configuration in Environment 'NOX CI/CD'"
+            exit 3
+          fi
 
       - name: Trigger managed scan in KNOX
         env:
@@ -23,6 +50,10 @@ jobs:
           REPO_WORKSPACE: ${{ vars.SL_REPO_WORKSPACE }}
           REPO_SLUG: ${{ vars.SL_REPO_SLUG }}
           REPO_BRANCH: ${{ github.ref_name }}
+          SCAN_PROFILE: strict
+          WAIT_FOR_RESULT: "true"
+          WAIT_TIMEOUT_SEC: "1200"
+          POLL_INTERVAL_SEC: "5"
         run: |
           set -euo pipefail
           API="${SL_API_URL%/}"
@@ -31,20 +62,32 @@ jobs:
 
           RESP="$(curl -fsS -u "x-token-auth:${SL_TRIGGER_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "{\"scan_profile\":\"strict\",\"wait_for_result\":true,\"wait_timeout_sec\":1200,\"poll_interval_sec\":5,\"repo_workspace\":\"${REPO_WORKSPACE}\",\"repo_slug\":\"${REPO_SLUG}\",\"repo_branch\":\"${REPO_BRANCH}\"}" \
+            -d "{\"scan_profile\":\"${SCAN_PROFILE}\",\"wait_for_result\":${WAIT_FOR_RESULT},\"wait_timeout_sec\":${WAIT_TIMEOUT_SEC},\"poll_interval_sec\":${POLL_INTERVAL_SEC},\"repo_workspace\":\"${REPO_WORKSPACE}\",\"repo_slug\":\"${REPO_SLUG}\",\"repo_branch\":\"${REPO_BRANCH}\"}" \
             "${TRIGGER_URL}")"
 
-          JOB_ID="$(echo "${RESP}" | jq -r '.scan_job_id')"
+          echo "$RESP" | jq .
+          JOB_ID="$(echo "$RESP" | jq -r '.scan_job_id // empty')"
+          [ -n "$JOB_ID" ] || { echo "scan_job_id missing"; exit 4; }
 
           while true; do
             ST="$(curl -fsS -u "x-token-auth:${SL_TRIGGER_TOKEN}" "${STATUS_BASE}/${JOB_ID}")"
-            STATUS="$(echo "${ST}" | jq -r '.job.status')"
+            STATUS="$(echo "$ST" | jq -r '.job.status // "unknown"')"
             echo "job=${JOB_ID} status=${STATUS}"
-            if [[ "${STATUS}" == "succeeded" ]]; then
-              VIOLATED="$(echo "${ST}" | jq -r '.job.policy_violated // false')"
-              [[ "${VIOLATED}" == "true" ]] && echo "Policy violated" && exit 1
+
+            if [[ "$STATUS" == "succeeded" ]]; then
+              echo "$ST" | jq .
+              VIOLATED="$(echo "$ST" | jq -r '.job.policy_violated // false')"
+              if [[ "$VIOLATED" == "true" ]]; then
+                echo "Policy violated"
+                exit 1
+              fi
               exit 0
             fi
-            [[ "${STATUS}" == "failed" || "${STATUS}" == "dead_letter" ]] && echo "${ST}" && exit 1
+
+            if [[ "$STATUS" == "failed" || "$STATUS" == "dead_letter" ]]; then
+              echo "$ST" | jq .
+              exit 1
+            fi
+
             sleep 5
           done
