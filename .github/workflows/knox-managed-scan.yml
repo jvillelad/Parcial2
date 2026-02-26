@@ -1,0 +1,50 @@
+name: KNOX Managed Scan
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  managed-scan:
+    runs-on: ubuntu-latest
+    environment: NOX CI/CD
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y curl jq
+
+      - name: Trigger managed scan in KNOX
+        env:
+          SL_API_URL: ${{ vars.SL_API_URL }}
+          SL_TRIGGER_TOKEN: ${{ secrets.SL_TRIGGER_TOKEN }}
+          SL_ORG_KEY: ${{ vars.SL_ORG_KEY }}
+          SL_PROJECT_KEY: ${{ vars.SL_PROJECT_KEY }}
+          REPO_WORKSPACE: ${{ vars.SL_REPO_WORKSPACE }}
+          REPO_SLUG: ${{ vars.SL_REPO_SLUG }}
+          REPO_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          API="${SL_API_URL%/}"
+          TRIGGER_URL="${API}/api/v1/orgs/${SL_ORG_KEY}/projects/${SL_PROJECT_KEY}/scans/trigger"
+          STATUS_BASE="${API}/api/v1/orgs/${SL_ORG_KEY}/projects/${SL_PROJECT_KEY}/scans/jobs"
+
+          RESP="$(curl -fsS -u "x-token-auth:${SL_TRIGGER_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"scan_profile\":\"strict\",\"wait_for_result\":true,\"wait_timeout_sec\":1200,\"poll_interval_sec\":5,\"repo_workspace\":\"${REPO_WORKSPACE}\",\"repo_slug\":\"${REPO_SLUG}\",\"repo_branch\":\"${REPO_BRANCH}\"}" \
+            "${TRIGGER_URL}")"
+
+          JOB_ID="$(echo "${RESP}" | jq -r '.scan_job_id')"
+
+          while true; do
+            ST="$(curl -fsS -u "x-token-auth:${SL_TRIGGER_TOKEN}" "${STATUS_BASE}/${JOB_ID}")"
+            STATUS="$(echo "${ST}" | jq -r '.job.status')"
+            echo "job=${JOB_ID} status=${STATUS}"
+            if [[ "${STATUS}" == "succeeded" ]]; then
+              VIOLATED="$(echo "${ST}" | jq -r '.job.policy_violated // false')"
+              [[ "${VIOLATED}" == "true" ]] && echo "Policy violated" && exit 1
+              exit 0
+            fi
+            [[ "${STATUS}" == "failed" || "${STATUS}" == "dead_letter" ]] && echo "${ST}" && exit 1
+            sleep 5
+          done
