@@ -8,7 +8,7 @@ on:
 jobs:
   managed-scan:
     runs-on: ubuntu-latest
-    environment: NOX CI/CD
+    environment: KNOXCICDSEC
 
     steps:
       - name: Checkout
