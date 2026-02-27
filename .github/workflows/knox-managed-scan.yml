@@ -9,6 +9,7 @@ jobs:
   managed-scan:
     runs-on: ubuntu-latest
     environment: KNOXCICDSEC
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -36,12 +37,18 @@ jobs:
               echo "$k=OK"
             fi
           done
+
+          if ! echo "${SL_API_URL}" | grep -Eq '^https?://[^/]+$'; then
+            echo "SL_API_URL invalid format: ${SL_API_URL}"
+            fail=1
+          fi
+
           if [ "$fail" -ne 0 ]; then
-            echo "Missing required configuration in Environment 'KNOXCICDSEC'"
+            echo "Missing/invalid required configuration in Environment 'KNOXCICDSEC'"
             exit 3
           fi
 
-      - name: Trigger managed scan in KNOX
+      - name: Trigger managed scan in KNOX (debug-safe)
         env:
           SL_API_URL: ${{ vars.SL_API_URL }}
           SL_TRIGGER_TOKEN: ${{ secrets.SL_TRIGGER_TOKEN }}
@@ -56,36 +63,88 @@ jobs:
           POLL_INTERVAL_SEC: "5"
         run: |
           set -euo pipefail
+
           API="${SL_API_URL%/}"
           TRIGGER_URL="${API}/api/v1/orgs/${SL_ORG_KEY}/projects/${SL_PROJECT_KEY}/scans/trigger"
           STATUS_BASE="${API}/api/v1/orgs/${SL_ORG_KEY}/projects/${SL_PROJECT_KEY}/scans/jobs"
 
-          RESP="$(curl -fsS -u "x-token-auth:${SL_TRIGGER_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "{\"scan_profile\":\"${SCAN_PROFILE}\",\"wait_for_result\":${WAIT_FOR_RESULT},\"wait_timeout_sec\":${WAIT_TIMEOUT_SEC},\"poll_interval_sec\":${POLL_INTERVAL_SEC},\"repo_workspace\":\"${REPO_WORKSPACE}\",\"repo_slug\":\"${REPO_SLUG}\",\"repo_branch\":\"${REPO_BRANCH}\"}" \
-            "${TRIGGER_URL}")"
+          echo "Trigger URL: ${TRIGGER_URL}"
+          echo "Repo: ${REPO_WORKSPACE}/${REPO_SLUG}@${REPO_BRANCH}"
 
-          echo "$RESP" | jq .
-          JOB_ID="$(echo "$RESP" | jq -r '.scan_job_id // empty')"
-          [ -n "$JOB_ID" ] || { echo "scan_job_id missing"; exit 4; }
+          PAYLOAD="$(jq -nc \
+            --arg scan_profile "${SCAN_PROFILE}" \
+            --argjson wait_for_result "${WAIT_FOR_RESULT}" \
+            --argjson wait_timeout_sec "${WAIT_TIMEOUT_SEC}" \
+            --argjson poll_interval_sec "${POLL_INTERVAL_SEC}" \
+            --arg repo_workspace "${REPO_WORKSPACE}" \
+            --arg repo_slug "${REPO_SLUG}" \
+            --arg repo_branch "${REPO_BRANCH}" \
+            '{
+              scan_profile: $scan_profile,
+              wait_for_result: $wait_for_result,
+              wait_timeout_sec: $wait_timeout_sec,
+              poll_interval_sec: $poll_interval_sec,
+              repo_workspace: $repo_workspace,
+              repo_slug: $repo_slug,
+              repo_branch: $repo_branch
+            }'
+          )"
+
+          RESP_FILE="$(mktemp)"
+          HTTP_CODE="$(
+            curl -sS \
+              -o "${RESP_FILE}" \
+              -w "%{http_code}" \
+              -u "x-token-auth:${SL_TRIGGER_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "${PAYLOAD}" \
+              "${TRIGGER_URL}"
+          )"
+
+          echo "trigger_http=${HTTP_CODE}"
+          cat "${RESP_FILE}" | jq . || cat "${RESP_FILE}"
+
+          if [ "${HTTP_CODE}" -ge 400 ]; then
+            echo "Trigger failed with HTTP ${HTTP_CODE}"
+            exit 22
+          fi
+
+          JOB_ID="$(jq -r '.scan_job_id // empty' "${RESP_FILE}")"
+          [ -n "${JOB_ID}" ] || { echo "scan_job_id missing"; exit 4; }
+
+          echo "scan_job_id=${JOB_ID}"
 
           while true; do
-            ST="$(curl -fsS -u "x-token-auth:${SL_TRIGGER_TOKEN}" "${STATUS_BASE}/${JOB_ID}")"
-            STATUS="$(echo "$ST" | jq -r '.job.status // "unknown"')"
+            ST_FILE="$(mktemp)"
+            ST_CODE="$(
+              curl -sS \
+                -o "${ST_FILE}" \
+                -w "%{http_code}" \
+                -u "x-token-auth:${SL_TRIGGER_TOKEN}" \
+                "${STATUS_BASE}/${JOB_ID}"
+            )"
+
+            if [ "${ST_CODE}" -ge 400 ]; then
+              echo "status_http=${ST_CODE}"
+              cat "${ST_FILE}" | jq . || cat "${ST_FILE}"
+              exit 23
+            fi
+
+            STATUS="$(jq -r '.job.status // "unknown"' "${ST_FILE}")"
             echo "job=${JOB_ID} status=${STATUS}"
 
-            if [[ "$STATUS" == "succeeded" ]]; then
-              echo "$ST" | jq .
-              VIOLATED="$(echo "$ST" | jq -r '.job.policy_violated // false')"
-              if [[ "$VIOLATED" == "true" ]]; then
+            if [[ "${STATUS}" == "succeeded" ]]; then
+              cat "${ST_FILE}" | jq .
+              VIOLATED="$(jq -r '.job.policy_violated // false' "${ST_FILE}")"
+              if [[ "${VIOLATED}" == "true" ]]; then
                 echo "Policy violated"
                 exit 1
               fi
               exit 0
             fi
 
-            if [[ "$STATUS" == "failed" || "$STATUS" == "dead_letter" ]]; then
-              echo "$ST" | jq .
+            if [[ "${STATUS}" == "failed" || "${STATUS}" == "dead_letter" ]]; then
+              cat "${ST_FILE}" | jq .
               exit 1
             fi
 
