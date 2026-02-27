@@ -18,7 +18,7 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y curl jq
 
-      - name: Validate required config
+      - name: Validate required env vars
         env:
           SL_API_URL: ${{ vars.SL_API_URL }}
           SL_TRIGGER_TOKEN: ${{ secrets.SL_TRIGGER_TOKEN }}
@@ -37,7 +37,7 @@ jobs:
               echo "$k=OK"
             fi
           done
-          [ "$fail" -eq 0 ] || { echo "Missing required environment config"; exit 3; }
+          [ "$fail" -eq 0 ] || { echo "Missing required configuration"; exit 3; }
 
       - name: Trigger managed scan and poll status
         env:
@@ -53,7 +53,6 @@ jobs:
           POLL_INTERVAL_SEC: "5"
         run: |
           set -euo pipefail
-
           API="${SL_API_URL%/}"
           TRIGGER_URL="${API}/api/v1/orgs/${SL_ORG_KEY}/projects/${SL_PROJECT_KEY}/scans/trigger"
           STATUS_BASE="${API}/api/v1/orgs/${SL_ORG_KEY}/projects/${SL_PROJECT_KEY}/scans/jobs"
@@ -61,93 +60,35 @@ jobs:
           echo "Trigger URL: ${TRIGGER_URL}"
           echo "Repo: ${REPO_WORKSPACE}/${REPO_SLUG}@${REPO_BRANCH}"
 
-          PAYLOAD="$(jq -nc \
-            --arg scan_profile "${SCAN_PROFILE}" \
-            --arg repo_workspace "${REPO_WORKSPACE}" \
-            --arg repo_slug "${REPO_SLUG}" \
-            --arg repo_branch "${REPO_BRANCH}" \
-            '{
-              scan_profile: $scan_profile,
-              wait_for_result: false,
-              repo_workspace: $repo_workspace,
-              repo_slug: $repo_slug,
-              repo_branch: $repo_branch
-            }'
-          )"
+          # Trigger async: wait_for_result=false (evita 504 en este request)
+          RESP="$(curl -sS -u "x-token-auth:${SL_TRIGGER_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"scan_profile\":\"${SCAN_PROFILE}\",\"wait_for_result\":false,\"repo_workspace\":\"${REPO_WORKSPACE}\",\"repo_slug\":\"${REPO_SLUG}\",\"repo_branch\":\"${REPO_BRANCH}\"}" \
+            "${TRIGGER_URL}")"
 
-          trigger_once() {
-            local body_file="$1"
-            local code
-            code="$(
-              curl -sS \
-                -o "${body_file}" \
-                -w "%{http_code}" \
-                -u "x-token-auth:${SL_TRIGGER_TOKEN}" \
-                -H "Content-Type: application/json" \
-                -d "${PAYLOAD}" \
-                "${TRIGGER_URL}" || true
-            )"
-            echo "${code}"
-          }
-
-          RESP_FILE="$(mktemp)"
-          HTTP_CODE=""
-          for attempt in 1 2 3 4 5; do
-            HTTP_CODE="$(trigger_once "${RESP_FILE}")"
-            echo "trigger_http=${HTTP_CODE} attempt=${attempt}"
-            if [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 300 ]; then
-              break
-            fi
-            if [[ "${HTTP_CODE}" =~ ^(408|425|429|500|502|503|504|520|521|522|523|524)$ ]] && [ "${attempt}" -lt 5 ]; then
-              sleep $((attempt * 3))
-              continue
-            fi
-            cat "${RESP_FILE}" | jq . || cat "${RESP_FILE}"
-            echo "Trigger failed with HTTP ${HTTP_CODE}"
-            exit 22
-          done
-
-          cat "${RESP_FILE}" | jq . || cat "${RESP_FILE}"
-          JOB_ID="$(jq -r '.scan_job_id // empty' "${RESP_FILE}")"
-          [ -n "${JOB_ID}" ] || { echo "scan_job_id missing"; exit 4; }
+          echo "$RESP" | jq .
+          JOB_ID="$(echo "$RESP" | jq -r '.scan_job_id // empty')"
+          [ -n "$JOB_ID" ] || { echo "scan_job_id missing"; exit 4; }
 
           deadline=$(( $(date +%s) + WAIT_TIMEOUT_SEC ))
 
           while [ "$(date +%s)" -lt "${deadline}" ]; do
-            ST_FILE="$(mktemp)"
-            ST_CODE="$(
-              curl -sS \
-                -o "${ST_FILE}" \
-                -w "%{http_code}" \
-                -u "x-token-auth:${SL_TRIGGER_TOKEN}" \
-                "${STATUS_BASE}/${JOB_ID}" || true
-            )"
-
-            if [ "${ST_CODE}" -lt 200 ] || [ "${ST_CODE}" -ge 300 ]; then
-              echo "status_http=${ST_CODE}"
-              cat "${ST_FILE}" | jq . || cat "${ST_FILE}"
-              if [[ "${ST_CODE}" =~ ^(408|425|429|500|502|503|504|520|521|522|523|524)$ ]]; then
-                sleep "${POLL_INTERVAL_SEC}"
-                continue
-              fi
-              exit 23
-            fi
-
-            STATUS="$(jq -r '.job.status // "unknown"' "${ST_FILE}")"
+            ST="$(curl -sS -u "x-token-auth:${SL_TRIGGER_TOKEN}" "${STATUS_BASE}/${JOB_ID}")"
+            STATUS="$(echo "$ST" | jq -r '.job.status // "unknown"')"
             echo "job=${JOB_ID} status=${STATUS}"
 
-            if [[ "${STATUS}" == "succeeded" ]]; then
-              cat "${ST_FILE}" | jq .
-              VIOLATED="$(jq -r '.job.policy_violated // false' "${ST_FILE}")"
-              if [[ "${VIOLATED}" == "true" ]]; then
+            if [[ "$STATUS" == "succeeded" ]]; then
+              echo "$ST" | jq .
+              VIOLATED="$(echo "$ST" | jq -r '.job.policy_violated // false')"
+              if [[ "$VIOLATED" == "true" ]]; then
                 echo "Policy violated"
                 exit 1
               fi
               exit 0
             fi
 
-            if [[ "${STATUS}" == "failed" || "${STATUS}" == "dead_letter" ]]; then
-              cat "${ST_FILE}" | jq .
+            if [[ "$STATUS" == "failed" || "$STATUS" == "dead_letter" ]]; then
+              echo "$ST" | jq .
               exit 1
             fi
 
