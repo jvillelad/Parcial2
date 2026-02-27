@@ -9,15 +9,16 @@ jobs:
   managed-scan:
     runs-on: ubuntu-latest
     environment: KNOXCICDSEC
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install deps
+      - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y curl jq
 
-      - name: Validate required vars
+      - name: Validate required config
         env:
           SL_API_URL: ${{ vars.SL_API_URL }}
           SL_TRIGGER_TOKEN: ${{ secrets.SL_TRIGGER_TOKEN }}
@@ -27,11 +28,18 @@ jobs:
           SL_REPO_SLUG: ${{ vars.SL_REPO_SLUG }}
         run: |
           set -euo pipefail
+          fail=0
           for k in SL_API_URL SL_TRIGGER_TOKEN SL_ORG_KEY SL_PROJECT_KEY SL_REPO_WORKSPACE SL_REPO_SLUG; do
-            [ -n "${!k:-}" ] || { echo "$k missing"; exit 3; }
+            if [ -z "${!k:-}" ]; then
+              echo "$k=MISSING"
+              fail=1
+            else
+              echo "$k=OK"
+            fi
           done
+          [ "$fail" -eq 0 ] || { echo "Missing required environment config"; exit 3; }
 
-      - name: Trigger and wait
+      - name: Trigger managed scan and poll status
         env:
           SL_API_URL: ${{ vars.SL_API_URL }}
           SL_TRIGGER_TOKEN: ${{ secrets.SL_TRIGGER_TOKEN }}
@@ -41,8 +49,7 @@ jobs:
           REPO_SLUG: ${{ vars.SL_REPO_SLUG }}
           REPO_BRANCH: ${{ github.ref_name }}
           SCAN_PROFILE: strict
-          WAIT_FOR_RESULT: "true"
-          WAIT_TIMEOUT_SEC: "1200"
+          WAIT_TIMEOUT_SEC: "1800"
           POLL_INTERVAL_SEC: "5"
         run: |
           set -euo pipefail
@@ -51,52 +58,78 @@ jobs:
           TRIGGER_URL="${API}/api/v1/orgs/${SL_ORG_KEY}/projects/${SL_PROJECT_KEY}/scans/trigger"
           STATUS_BASE="${API}/api/v1/orgs/${SL_ORG_KEY}/projects/${SL_PROJECT_KEY}/scans/jobs"
 
-          PAYLOAD="$(jq -nc \
-            --arg scan_profile "${SCAN_PROFILE}" \
-            --argjson wait_for_result "${WAIT_FOR_RESULT}" \
-            --argjson wait_timeout_sec "${WAIT_TIMEOUT_SEC}" \
-            --argjson poll_interval_sec "${POLL_INTERVAL_SEC}" \
-            --arg repo_workspace "${REPO_WORKSPACE}" \
-            --arg repo_slug "${REPO_SLUG}" \
-            --arg repo_branch "${REPO_BRANCH}" \
-            '{scan_profile:$scan_profile,wait_for_result:$wait_for_result,wait_timeout_sec:$wait_timeout_sec,poll_interval_sec:$poll_interval_sec,repo_workspace:$repo_workspace,repo_slug:$repo_slug,repo_branch:$repo_branch}'
-          )"
-
           echo "Trigger URL: ${TRIGGER_URL}"
           echo "Repo: ${REPO_WORKSPACE}/${REPO_SLUG}@${REPO_BRANCH}"
 
-          RESP_FILE="$(mktemp)"
-          HDR_FILE="$(mktemp)"
-          HTTP_CODE="$(
-            curl -sS -D "${HDR_FILE}" -o "${RESP_FILE}" -w "%{http_code}" \
-              -u "x-token-auth:${SL_TRIGGER_TOKEN}" \
-              -H "Content-Type: application/json" \
-              -d "${PAYLOAD}" \
-              "${TRIGGER_URL}"
+          PAYLOAD="$(jq -nc \
+            --arg scan_profile "${SCAN_PROFILE}" \
+            --arg repo_workspace "${REPO_WORKSPACE}" \
+            --arg repo_slug "${REPO_SLUG}" \
+            --arg repo_branch "${REPO_BRANCH}" \
+            '{
+              scan_profile: $scan_profile,
+              wait_for_result: false,
+              repo_workspace: $repo_workspace,
+              repo_slug: $repo_slug,
+              repo_branch: $repo_branch
+            }'
           )"
 
-          echo "trigger_http=${HTTP_CODE}"
-          sed -n '1,20p' "${HDR_FILE}"
-          cat "${RESP_FILE}" | jq . || cat "${RESP_FILE}"
+          trigger_once() {
+            local body_file="$1"
+            local code
+            code="$(
+              curl -sS \
+                -o "${body_file}" \
+                -w "%{http_code}" \
+                -u "x-token-auth:${SL_TRIGGER_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "${PAYLOAD}" \
+                "${TRIGGER_URL}" || true
+            )"
+            echo "${code}"
+          }
 
-          if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
+          RESP_FILE="$(mktemp)"
+          HTTP_CODE=""
+          for attempt in 1 2 3 4 5; do
+            HTTP_CODE="$(trigger_once "${RESP_FILE}")"
+            echo "trigger_http=${HTTP_CODE} attempt=${attempt}"
+            if [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 300 ]; then
+              break
+            fi
+            if [[ "${HTTP_CODE}" =~ ^(408|425|429|500|502|503|504|520|521|522|523|524)$ ]] && [ "${attempt}" -lt 5 ]; then
+              sleep $((attempt * 3))
+              continue
+            fi
+            cat "${RESP_FILE}" | jq . || cat "${RESP_FILE}"
+            echo "Trigger failed with HTTP ${HTTP_CODE}"
             exit 22
-          fi
+          done
 
+          cat "${RESP_FILE}" | jq . || cat "${RESP_FILE}"
           JOB_ID="$(jq -r '.scan_job_id // empty' "${RESP_FILE}")"
           [ -n "${JOB_ID}" ] || { echo "scan_job_id missing"; exit 4; }
 
-          while true; do
+          deadline=$(( $(date +%s) + WAIT_TIMEOUT_SEC ))
+
+          while [ "$(date +%s)" -lt "${deadline}" ]; do
             ST_FILE="$(mktemp)"
             ST_CODE="$(
-              curl -sS -o "${ST_FILE}" -w "%{http_code}" \
+              curl -sS \
+                -o "${ST_FILE}" \
+                -w "%{http_code}" \
                 -u "x-token-auth:${SL_TRIGGER_TOKEN}" \
-                "${STATUS_BASE}/${JOB_ID}"
+                "${STATUS_BASE}/${JOB_ID}" || true
             )"
 
             if [ "${ST_CODE}" -lt 200 ] || [ "${ST_CODE}" -ge 300 ]; then
               echo "status_http=${ST_CODE}"
               cat "${ST_FILE}" | jq . || cat "${ST_FILE}"
+              if [[ "${ST_CODE}" =~ ^(408|425|429|500|502|503|504|520|521|522|523|524)$ ]]; then
+                sleep "${POLL_INTERVAL_SEC}"
+                continue
+              fi
               exit 23
             fi
 
@@ -104,9 +137,12 @@ jobs:
             echo "job=${JOB_ID} status=${STATUS}"
 
             if [[ "${STATUS}" == "succeeded" ]]; then
-              VIOLATED="$(jq -r '.job.policy_violated // false' "${ST_FILE}")"
               cat "${ST_FILE}" | jq .
-              [[ "${VIOLATED}" == "true" ]] && exit 1
+              VIOLATED="$(jq -r '.job.policy_violated // false' "${ST_FILE}")"
+              if [[ "${VIOLATED}" == "true" ]]; then
+                echo "Policy violated"
+                exit 1
+              fi
               exit 0
             fi
 
@@ -115,5 +151,8 @@ jobs:
               exit 1
             fi
 
-            sleep 5
+            sleep "${POLL_INTERVAL_SEC}"
           done
+
+          echo "Timeout waiting for terminal scan status"
+          exit 124
